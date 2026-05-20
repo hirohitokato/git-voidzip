@@ -1,6 +1,19 @@
 #!/usr/bin/env node
 "use strict";
 
+// Design overview:
+// - Read the repository snapshot directly from a Git ref instead of the working tree,
+//   so the archive is reproducible from committed objects and does not depend on
+//   local untracked files or filesystem state.
+// - Decide whether to scrub a file to an empty payload by combining two heuristics:
+//   a path-based allowlist for common media/binary container extensions and a
+//   lightweight content-based binary check for everything else.
+// - Stream the ZIP file out entry by entry while building the central directory in
+//   memory, which keeps the implementation simple and avoids materializing a second
+//   full archive buffer before writing it to disk.
+// - Emit empty files instead of removing entries entirely so the directory layout,
+//   filenames, and executable/link metadata remain visible in the resulting archive.
+
 const fs = require("node:fs");
 const path = require("node:path");
 const zlib = require("node:zlib");
@@ -46,6 +59,8 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
 
+    // Keep the CLI surface intentionally small and explicit so the archive behavior
+    // is easy to reason about from automation and shell scripts.
     if (a === "--repo") args.repo = requireValue(argv, ++i, "--repo");
     else if (a === "--ref") args.ref = requireValue(argv, ++i, "--ref");
     else if (a === "--output" || a === "-o") args.output = requireValue(argv, ++i, "--output");
@@ -72,6 +87,8 @@ function parseArgs(argv) {
 
 function requireValue(argv, index, name) {
   const value = argv[index];
+  // Treat another flag in value position as "missing" so argument mistakes fail fast
+  // with a targeted error instead of cascading into confusing downstream parsing.
   if (!value || value.startsWith("--")) {
     throw new Error(`Missing value for ${name}`);
   }
@@ -80,6 +97,8 @@ function requireValue(argv, index, name) {
 
 function normalizePrefix(prefix) {
   if (!prefix) return "";
+  // ZIP entry names always use forward slashes; normalizing here lets callers pass
+  // either Windows or POSIX-like prefixes without affecting the archive layout.
   const p = prefix.replaceAll("\\", "/").replace(/^\/+/, "");
   return p.endsWith("/") ? p : `${p}/`;
 }
@@ -105,6 +124,8 @@ Modes:
 }
 
 function git(repo, args, options = {}) {
+  // Execute Git plumbing commands synchronously because the archive is written in a
+  // single deterministic pass and each file depends on the previous ZIP offset.
   return execFileSync("git", ["-C", repo, ...args], {
     encoding: options.encoding ?? "buffer",
     stdio: ["ignore", "pipe", "pipe"],
@@ -113,6 +134,8 @@ function git(repo, args, options = {}) {
 }
 
 function listTree(repo, ref) {
+  // Ask Git for a NUL-delimited tree listing so paths are parsed safely even when
+  // they contain whitespace or other shell-hostile characters.
   const output = git(repo, ["ls-tree", "-rz", "--full-tree", ref]);
   const records = [];
 
@@ -126,6 +149,8 @@ function listTree(repo, ref) {
     const filePath = chunk.subarray(tab + 1).toString("utf8");
 
     const [mode, type, object] = meta.split(" ");
+    // Only blobs map to file payloads in the ZIP; tree entries are traversed by
+    // ls-tree already, so non-blob records are not useful here.
     if (type !== "blob") continue;
 
     records.push({ mode, object, path: filePath });
@@ -140,6 +165,7 @@ function splitNul(buffer) {
 
   for (let i = 0; i < buffer.length; i++) {
     if (buffer[i] === 0) {
+      // Return slices instead of copying so large tree listings stay cheap to split.
       parts.push(buffer.subarray(start, i));
       start = i + 1;
     }
@@ -153,6 +179,8 @@ function splitNul(buffer) {
 }
 
 function readBlob(repo, object) {
+  // Read the blob by object id so we always archive the exact content referenced by
+  // the chosen ref, regardless of what is currently checked out on disk.
   return git(repo, ["cat-file", "-p", object]);
 }
 
@@ -163,6 +191,8 @@ function isMediaPath(filePath) {
 function appearsBinary(buffer) {
   const limit = Math.min(buffer.length, 8192);
 
+  // A NUL byte in the first chunk is a conservative, fast binary signal that avoids
+  // scanning entire large files before deciding whether to scrub them.
   for (let i = 0; i < limit; i++) {
     if (buffer[i] === 0) return true;
   }
@@ -171,20 +201,28 @@ function appearsBinary(buffer) {
 }
 
 function shouldScrubByPath(filePath, mode) {
+  // Path-based scrubbing catches common binary/media formats without paying the cost
+  // of reading and inspecting bytes when the extension is already decisive.
   return (mode === "media" || mode === "both") && isMediaPath(filePath);
 }
 
 function shouldScrubByContent(buffer, mode) {
+  // Content-based scrubbing is the fallback for files whose names do not reveal that
+  // they are binary, such as extensionless assets or atypically named artifacts.
   return (mode === "binary" || mode === "both") && appearsBinary(buffer);
 }
 
 function unixModeFromGitMode(gitMode) {
+  // Preserve executable and symlink semantics from Git mode bits so the archive keeps
+  // useful metadata even when a file's payload is replaced with an empty body.
   if (gitMode === "100755") return 0o100755;
   if (gitMode === "120000") return 0o120777;
   return 0o100644;
 }
 
 function normalizeZipPath(filePath) {
+  // Canonicalize entry names defensively so ZIP consumers see stable relative paths
+  // without duplicated separators or accidental leading slashes.
   return filePath
     .replaceAll("\\", "/")
     .replace(/^\/+/, "")
@@ -196,6 +234,8 @@ function normalizeZipPath(filePath) {
 function dosDateTime(date = new Date()) {
   const year = Math.max(date.getFullYear(), 1980);
 
+  // Classic ZIP stores timestamps in DOS date/time fields; clamp the year because
+  // values before 1980 cannot be represented in that format.
   return {
     dosTime:
       (date.getHours() << 11) |
@@ -215,6 +255,8 @@ const CRC_TABLE = (() => {
   for (let i = 0; i < 256; i++) {
     let c = i;
 
+    // Precompute the polynomial walk once so each crc32 call can stay linear over
+    // input bytes without repeating the bit-level setup cost.
     for (let k = 0; k < 8; k++) {
       c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
     }
@@ -228,6 +270,8 @@ const CRC_TABLE = (() => {
 function crc32(buffer) {
   let crc = 0xffffffff;
 
+  // ZIP headers require CRC-32 of the uncompressed data even when the entry is later
+  // deflated, so compute it from the original payload first.
   for (let i = 0; i < buffer.length; i++) {
     crc = CRC_TABLE[(crc ^ buffer[i]) & 0xff] ^ (crc >>> 8);
   }
@@ -236,6 +280,8 @@ function crc32(buffer) {
 }
 
 function u16(value) {
+  // Build little-endian fields explicitly because ZIP is a binary format and Node's
+  // Buffer helpers are clearer than manual bit shifting at each call site.
   const b = Buffer.allocUnsafe(2);
   b.writeUInt16LE(value & 0xffff, 0);
   return b;
@@ -250,12 +296,16 @@ function u32(value) {
 async function writeBuffer(stream, buffer) {
   if (buffer.length === 0) return;
 
+  // Honor backpressure so large archives do not keep queueing buffers faster than
+  // the writable stream can flush them to disk.
   if (!stream.write(buffer)) {
     await once(stream, "drain");
   }
 }
 
 async function finishStream(stream) {
+  // Wait for the finish event to ensure every buffered ZIP structure is persisted
+  // before reporting success to the caller.
   stream.end();
   await once(stream, "finish");
 }
@@ -264,10 +314,14 @@ async function writeZipEntry(stream, entry, offset, dosTimeDate) {
   const nameBuffer = Buffer.from(entry.name, "utf8");
   const input = entry.data;
 
+  // Store empty files uncompressed and deflate non-empty files. This keeps scrubbed
+  // placeholders tiny while still reducing size for preserved text content.
   const method = input.length === 0 ? 0 : 8;
   const compressed = method === 0 ? input : zlib.deflateRawSync(input);
   const crc = crc32(input);
 
+  // Emit a local file header followed immediately by the file payload so the archive
+  // can be streamed sequentially without seeking backwards.
   const localHeader = Buffer.concat([
     u32(0x04034b50),
     u16(20),
@@ -306,6 +360,8 @@ async function writeCentralDirectory(stream, records, centralStart) {
   let offset = centralStart;
 
   for (const record of records) {
+    // Carry UNIX mode bits in the external attributes field so tools that extract the
+    // archive can reconstruct executability and symlink markers where supported.
     const externalAttrs = (record.unixMode << 16) >>> 0;
 
     const centralHeader = Buffer.concat([
@@ -338,6 +394,8 @@ async function writeCentralDirectory(stream, records, centralStart) {
 
 async function writeEndOfCentralDirectory(stream, recordCount, centralSize, centralStart) {
   if (recordCount > 0xffff) {
+    // The rest of the writer only emits classic ZIP structures, so reject inputs that
+    // would require ZIP64 metadata instead of silently producing a broken archive.
     throw new Error("ZIP64 is not supported yet: too many files for classic ZIP format");
   }
 
@@ -359,6 +417,8 @@ async function createZipFromGitStreamed(args) {
   const repo = path.resolve(args.repo);
   const files = listTree(repo, args.ref);
 
+  // Stream directly to the requested output file and retain only the central directory
+  // metadata in memory, which scales better than buffering all entry payloads twice.
   const output = fs.createWriteStream(args.output);
   const centralDirectoryRecords = [];
   const dosTimeDate = dosDateTime();
@@ -375,11 +435,15 @@ async function createZipFromGitStreamed(args) {
       let scrub = shouldScrubByPath(relativePath, args.mode);
 
       if (scrub) {
+        // If the extension already marks the file as sensitive or non-textual, avoid
+        // reading the blob body at all and substitute an empty placeholder immediately.
         data = Buffer.alloc(0);
       } else {
         const blob = readBlob(repo, file.object);
 
         if (shouldScrubByContent(blob, args.mode)) {
+          // Fall back to content inspection only when the pathname did not already
+          // decide the outcome, keeping the common path-based case fast.
           data = Buffer.alloc(0);
           scrub = true;
         } else {
@@ -406,6 +470,8 @@ async function createZipFromGitStreamed(args) {
 
     const centralStart = offset;
 
+    // ZIP readers discover the archive through the central directory, so write it
+    // after all local entries once their final offsets are known.
     const centralSize = await writeCentralDirectory(
       output,
       centralDirectoryRecords,
@@ -426,12 +492,16 @@ async function createZipFromGitStreamed(args) {
       scrubbed,
     };
   } catch (error) {
+    // Tear down the stream on any failure so callers do not mistake a partial file for
+    // a valid archive.
     output.destroy();
     throw error;
   }
 }
 
 async function main() {
+  // Keep main small: parse user input, execute the archive build, then report a terse
+  // summary that is convenient for both humans and shell logs.
   const args = parseArgs(process.argv.slice(2));
   const result = await createZipFromGitStreamed(args);
 
@@ -441,6 +511,8 @@ async function main() {
 }
 
 main().catch((error) => {
+  // Surface only the message because the most common failures are user-facing input
+  // or repository issues where a compact CLI error is easier to consume than a stack.
   console.error(`Error: ${error.message}`);
   process.exit(1);
 });
