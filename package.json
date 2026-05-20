@@ -1,0 +1,30 @@
+{
+  "name": "git-voidzip",
+  "version": "0.1.0",
+  "description": "Create ZIP archives from Git trees while replacing media and binary files with empty files.",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "git-voidzip": "./bin/git-voidzip.js"
+  },
+  "scripts": {
+    "test": "node test/smoke-test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "git",
+    "archive",
+    "zip",
+    "scrub",
+    "binary",
+    "media"
+  ],
+  "files": [
+    "bin/",
+    "README.md",
+    "README.ja.md",
+    "LICENSE"
+  ]
+}
