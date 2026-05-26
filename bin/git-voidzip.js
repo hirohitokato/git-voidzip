@@ -29,9 +29,9 @@ const MEDIA_EXTENSIONS = new Set([
   ".mp3", ".wav", ".flac", ".aac", ".m4a", ".ogg", ".oga", ".opus",
   ".wma", ".aiff", ".aif", ".mid", ".midi",
 
-  // Video
+  // Video. note: .ts is TypeScript source file
   ".mp4", ".mov", ".avi", ".mkv", ".webm", ".mpeg", ".mpg", ".m4v",
-  ".wmv", ".flv", ".3gp", ".ts", ".m2ts",
+  ".wmv", ".flv", ".3gp", ".m2ts",
 
   // Fonts
   ".ttf", ".otf", ".woff", ".woff2", ".eot",
